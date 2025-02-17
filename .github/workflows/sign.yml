@@ -1,0 +1,99 @@
+name: Sign IPA
+
+on:
+  workflow_call:
+    inputs:
+      ipa_url:
+        description: "Direct download URL for the IPA file"
+        required: true
+        type: string
+      cert_type:
+        description: "Certificate type (development/distribution)"
+        required: true
+        type: string
+      apple_id:
+        description: "Apple ID email"
+        required: true
+        type: string
+      signing_args:
+        description: "Space-separated signing arguments"
+        required: false
+        type: string
+    secrets:
+      DEVELOPMENT_CERT:
+        required: true
+      DEVELOPMENT_CERT_PASSWORD:
+        required: true
+      DISTRIBUTION_CERT:
+        required: true
+      DISTRIBUTION_CERT_PASSWORD:
+        required: true
+      APPLE_AUTH_COOKIES:
+        required: true
+      APPLE_AUTH_SESSION:
+        required: true
+
+jobs:
+  sign:
+    runs-on: macos-latest
+    outputs:
+      upload_url: ${{ steps.upload.outputs.url }}
+    env:
+      NON_INTERACTIVE: "1"
+      APPLE_ID: ${{ github.event.inputs.apple_id }}
+      WARPSIGN_CERT_TYPE: ${{ github.event.inputs.cert_type }}
+      IPA_URL: ${{ github.event.inputs.ipa_url }}
+      WARPSIGN_CERT_DIR: ${{ github.workspace }}/certs
+      WARPSIGN_SESSION_DIR: ${{ runner.temp }}/warpsign-session
+      SIGNING_ARGS: ${{ inputs.signing_args }}
+
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/checkout@v3
+        with:
+          repository: "teflocarbon/warpsign"
+          path: "warpsign"
+
+      - name: Setup directories
+        run: |
+          mkdir -p "$WARPSIGN_CERT_DIR/development"
+          mkdir -p "$WARPSIGN_CERT_DIR/distribution"
+          mkdir -p "$WARPSIGN_SESSION_DIR"
+
+      - name: Setup certificates
+        run: |
+          if [ "$WARPSIGN_CERT_TYPE" == "development" ]; then
+            echo "${{ secrets.DEVELOPMENT_CERT }}" | base64 --decode > "$WARPSIGN_CERT_DIR/development/cert.p12"
+            echo "${{ secrets.DEVELOPMENT_CERT_PASSWORD }}" > "$WARPSIGN_CERT_DIR/development/cert_pass.txt"
+          else
+            echo "${{ secrets.DISTRIBUTION_CERT }}" | base64 --decode > "$WARPSIGN_CERT_DIR/distribution/cert.p12"
+            echo "${{ secrets.DISTRIBUTION_CERT_PASSWORD }}" > "$WARPSIGN_CERT_DIR/distribution/cert_pass.txt"
+          fi
+
+      - name: Download IPA
+        run: curl -L "$IPA_URL" -o app.ipa
+
+      - name: Install Python requirements
+        run: |
+          cd warpsign
+          pip3 install -r requirements.txt
+
+      - name: Sign IPA
+        run: |
+          cd warpsign
+          python3 ci.py ../app.ipa $SIGNING_ARGS
+          cp app-signed.ipa ../signed.ipa
+        env:
+          APPLE_AUTH_COOKIES: ${{ secrets.APPLE_AUTH_COOKIES }}
+          APPLE_AUTH_SESSION: ${{ secrets.APPLE_AUTH_SESSION }}
+
+      - name: Download Litterbox uploader
+        run: |
+          curl -L -o litterbox-uploader https://github.com/teflocarbon/litterbox-rust-upload/releases/download/release/litterbox-rust-upload-macOS-arm64
+          chmod +x litterbox-uploader
+
+      - name: Upload to Litterbox
+        id: upload
+        run: |
+          UPLOAD_URL=$(./litterbox-uploader signed.ipa | grep "Upload successful:" | cut -d' ' -f3)
+          echo "url=$UPLOAD_URL" >> $GITHUB_OUTPUT
