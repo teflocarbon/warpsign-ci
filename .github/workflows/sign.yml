@@ -1,8 +1,13 @@
 name: Sign IPA
+run-name: "[${{ inputs.run_uuid }}]"
 
 on:
-  workflow_call:
+  workflow_dispatch:
     inputs:
+      run_uuid:
+        description: "Run identifier"
+        required: true
+        type: string
       ipa_url:
         description: "Direct download URL for the IPA file"
         required: true
@@ -19,19 +24,6 @@ on:
         description: "Space-separated signing arguments"
         required: false
         type: string
-    secrets:
-      DEVELOPMENT_CERT:
-        required: true
-      DEVELOPMENT_CERT_PASSWORD:
-        required: true
-      DISTRIBUTION_CERT:
-        required: true
-      DISTRIBUTION_CERT_PASSWORD:
-        required: true
-      APPLE_AUTH_COOKIES:
-        required: true
-      APPLE_AUTH_SESSION:
-        required: true
 
 jobs:
   sign:
@@ -40,12 +32,13 @@ jobs:
       upload_url: ${{ steps.upload.outputs.url }}
     env:
       NON_INTERACTIVE: "1"
+      USING_GH_ACTIONS: "1"
       APPLE_ID: ${{ github.event.inputs.apple_id }}
       WARPSIGN_CERT_TYPE: ${{ github.event.inputs.cert_type }}
       IPA_URL: ${{ github.event.inputs.ipa_url }}
-      WARPSIGN_CERT_DIR: ${{ github.workspace }}/certs
-      WARPSIGN_SESSION_DIR: ${{ runner.temp }}/warpsign-session
-      SIGNING_ARGS: ${{ inputs.signing_args }}
+      SIGNING_ARGS: ${{ github.event.inputs.signing_args }}
+      FORCE_COLOR: "1"
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - uses: actions/checkout@v3
@@ -53,47 +46,78 @@ jobs:
         with:
           repository: "teflocarbon/warpsign"
           path: "warpsign"
+          ref: "ci"
 
       - name: Setup directories
         run: |
-          mkdir -p "$WARPSIGN_CERT_DIR/development"
-          mkdir -p "$WARPSIGN_CERT_DIR/distribution"
+          WARPSIGN_CERT_DIR="${{ runner.temp }}/warpsign-certs"
+          WARPSIGN_SESSION_DIR="${{ runner.temp }}/warpsign-session"
+
+          mkdir -p "$WARPSIGN_CERT_DIR"/{development,distribution}
           mkdir -p "$WARPSIGN_SESSION_DIR"
+
+          echo "WARPSIGN_CERT_DIR=$WARPSIGN_CERT_DIR" >> $GITHUB_ENV
+          echo "WARPSIGN_SESSION_DIR=$WARPSIGN_SESSION_DIR" >> $GITHUB_ENV
+
+      - name: Setup authentication session
+        env:
+          APPLE_AUTH_COOKIES: ${{ secrets.APPLE_AUTH_COOKIES }}
+          APPLE_AUTH_SESSION: ${{ secrets.APPLE_AUTH_SESSION }}
+          APPLE_AUTH_ID: ${{ secrets.APPLE_AUTH_ID }}
+        run: |
+          # Process cookies
+          echo "$APPLE_AUTH_COOKIES" > "$WARPSIGN_SESSION_DIR/cookies.b64"
+          base64 -D -i "$WARPSIGN_SESSION_DIR/cookies.b64" > "$WARPSIGN_SESSION_DIR/$APPLE_AUTH_ID.cookies"
+          rm "$WARPSIGN_SESSION_DIR/cookies.b64"
+
+          # Process session
+          echo "$APPLE_AUTH_SESSION" > "$WARPSIGN_SESSION_DIR/session.b64"
+          base64 -D -i "$WARPSIGN_SESSION_DIR/session.b64" > "$WARPSIGN_SESSION_DIR/$APPLE_AUTH_ID.session"
+          rm "$WARPSIGN_SESSION_DIR/session.b64"
 
       - name: Setup certificates
         run: |
           if [ "$WARPSIGN_CERT_TYPE" == "development" ]; then
-            echo "${{ secrets.DEVELOPMENT_CERT }}" | base64 --decode > "$WARPSIGN_CERT_DIR/development/cert.p12"
+            # Process development certificate
+            echo "${{ secrets.DEVELOPMENT_CERT }}" > "$WARPSIGN_CERT_DIR/development/cert.p12.b64"
+            base64 -D -i "$WARPSIGN_CERT_DIR/development/cert.p12.b64" -o "$WARPSIGN_CERT_DIR/development/cert.p12"
             echo "${{ secrets.DEVELOPMENT_CERT_PASSWORD }}" > "$WARPSIGN_CERT_DIR/development/cert_pass.txt"
+            rm "$WARPSIGN_CERT_DIR/development/cert.p12.b64"
           else
-            echo "${{ secrets.DISTRIBUTION_CERT }}" | base64 --decode > "$WARPSIGN_CERT_DIR/distribution/cert.p12"
+            # Process distribution certificate
+            echo "${{ secrets.DISTRIBUTION_CERT }}" > "$WARPSIGN_CERT_DIR/distribution/cert.p12.b64"
+            base64 -D -i "$WARPSIGN_CERT_DIR/distribution/cert.p12.b64" -o "$WARPSIGN_CERT_DIR/distribution/cert.p12"
             echo "${{ secrets.DISTRIBUTION_CERT_PASSWORD }}" > "$WARPSIGN_CERT_DIR/distribution/cert_pass.txt"
+            rm "$WARPSIGN_CERT_DIR/distribution/cert.p12.b64"
           fi
 
       - name: Download IPA
         run: curl -L "$IPA_URL" -o app.ipa
 
-      - name: Install Python requirements
+      - name: Setup Python
         run: |
-          cd warpsign
-          pip3 install -r requirements.txt
+          python3 -m venv .venv
+          source .venv/bin/activate
+          echo "VIRTUAL_ENV=$VIRTUAL_ENV" >> $GITHUB_ENV
+          echo "$VIRTUAL_ENV/bin" >> $GITHUB_PATH
+          cd warpsign && pip3 install -r requirements.txt
+
+      - name: Install ldid
+        run: |
+          brew install ldid-procursus
 
       - name: Sign IPA
         run: |
+          source .venv/bin/activate
           cd warpsign
           python3 ci.py ../app.ipa $SIGNING_ARGS
-          cp app-signed.ipa ../signed.ipa
-        env:
-          APPLE_AUTH_COOKIES: ${{ secrets.APPLE_AUTH_COOKIES }}
-          APPLE_AUTH_SESSION: ${{ secrets.APPLE_AUTH_SESSION }}
-
-      - name: Download Litterbox uploader
-        run: |
-          curl -L -o litterbox-uploader https://github.com/teflocarbon/litterbox-rust-upload/releases/download/release/litterbox-rust-upload-macOS-arm64
-          chmod +x litterbox-uploader
+          cp ../app-signed.ipa ../signed.ipa
 
       - name: Upload to Litterbox
         id: upload
         run: |
+          curl -L -o litterbox-uploader https://github.com/teflocarbon/litterbox-rust-upload/releases/download/release/litterbox-rust-upload-macOS-arm64
+          chmod +x litterbox-uploader
           UPLOAD_URL=$(./litterbox-uploader signed.ipa | grep "Upload successful:" | cut -d' ' -f3)
           echo "url=$UPLOAD_URL" >> $GITHUB_OUTPUT
+          echo "Final URL: $UPLOAD_URL"
