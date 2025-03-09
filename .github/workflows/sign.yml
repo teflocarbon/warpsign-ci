@@ -46,7 +46,6 @@ jobs:
         with:
           repository: "teflocarbon/warpsign"
           path: "warpsign"
-          ref: "ci"
 
       - name: Setup directories
         run: |
@@ -92,7 +91,7 @@ jobs:
           fi
 
       - name: Download IPA
-        run: curl -L "$IPA_URL" -o app.ipa
+        run: aria2c -x 16 -s 16 -o app.ipa "$IPA_URL"
 
       - name: Setup Python
         run: |
