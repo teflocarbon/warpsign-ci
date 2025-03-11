@@ -9,7 +9,7 @@ on:
         required: true
         type: string
       ipa_url:
-        description: "Direct download URL for the IPA file"
+        description: "Direct download URL for the IPA file or croc code"
         required: true
         type: string
       cert_type:
@@ -24,6 +24,11 @@ on:
         description: "Space-separated signing arguments"
         required: false
         type: string
+      use_croc:
+        description: "Use croc for file transfer (true/false)"
+        required: false
+        default: "false"
+        type: string
 
 jobs:
   sign:
@@ -37,6 +42,7 @@ jobs:
       WARPSIGN_CERT_TYPE: ${{ github.event.inputs.cert_type }}
       IPA_URL: ${{ github.event.inputs.ipa_url }}
       SIGNING_ARGS: ${{ github.event.inputs.signing_args }}
+      USE_CROC: ${{ github.event.inputs.use_croc }}
       FORCE_COLOR: "1"
       PYTHONUNBUFFERED: "1"
 
@@ -46,17 +52,21 @@ jobs:
         with:
           repository: "teflocarbon/warpsign"
           path: "warpsign"
+          ref: "main"
 
       - name: Setup directories
         run: |
           WARPSIGN_CERT_DIR="${{ runner.temp }}/warpsign-certs"
           WARPSIGN_SESSION_DIR="${{ runner.temp }}/warpsign-session"
+          WARPSIGN_DOWNLOAD_DIR="${{ runner.temp }}/warpsign-download"
 
           mkdir -p "$WARPSIGN_CERT_DIR"/{development,distribution}
           mkdir -p "$WARPSIGN_SESSION_DIR"
+          mkdir -p "$WARPSIGN_DOWNLOAD_DIR"
 
           echo "WARPSIGN_CERT_DIR=$WARPSIGN_CERT_DIR" >> $GITHUB_ENV
           echo "WARPSIGN_SESSION_DIR=$WARPSIGN_SESSION_DIR" >> $GITHUB_ENV
+          echo "WARPSIGN_DOWNLOAD_DIR=$WARPSIGN_DOWNLOAD_DIR" >> $GITHUB_ENV
 
       - name: Setup authentication session
         env:
@@ -90,7 +100,34 @@ jobs:
             rm "$WARPSIGN_CERT_DIR/distribution/cert.p12.b64"
           fi
 
-      - name: Download IPA
+      - name: Install croc
+        if: ${{ github.event.inputs.use_croc == 'true' }}
+        run: |
+          curl -fsSL https://getcroc.schollz.com | bash
+
+      - name: Download IPA with croc
+        if: ${{ github.event.inputs.use_croc == 'true' }}
+        env:
+          CROC_SECRET: ${{ github.event.inputs.ipa_url }}
+        run: |
+          # Receive the file into the download directory
+          croc --yes --out "$WARPSIGN_DOWNLOAD_DIR"
+
+          # Find the IPA file and move to the working directory
+          echo "Finding IPA file in download directory..."
+          IPA_FILE=$(find "$WARPSIGN_DOWNLOAD_DIR" -name "*.ipa" -type f | head -n 1)
+
+          if [ -z "$IPA_FILE" ]; then
+            echo "Error: No IPA file found in download directory"
+            exit 1
+          fi
+
+          echo "Found IPA file: $IPA_FILE"
+          cp "$IPA_FILE" "./app.ipa"
+          echo "IPA file copied to working directory"
+
+      - name: Download IPA with aria2
+        if: ${{ github.event.inputs.use_croc != 'true' }}
         run: aria2c -x 16 -s 16 -o app.ipa "$IPA_URL"
 
       - name: Setup Python
@@ -112,8 +149,61 @@ jobs:
           python3 ci.py ../app.ipa $SIGNING_ARGS
           cp ../app-signed.ipa ../signed.ipa
 
+      - name: Upload IPA with croc
+        if: ${{ github.event.inputs.use_croc == 'true' }}
+        env:
+          CROC_SECRET: ${{ github.event.inputs.ipa_url }} # Reuse the same code
+          NON_INTERACTIVE: 1
+          USING_GH_ACTIONS: 1
+        run: |
+          # Start croc in background and capture output
+          croc send signed.ipa < /dev/null > croc_output.log 2>&1 &
+          croc_pid=$!
+          
+          # Wait for up to 30 seconds for connection to establish
+          connection_timeout=30
+          connection_start_time=$(date +%s)
+          connection_established=false
+          
+          echo "Waiting for croc connection to establish (${connection_timeout}s timeout)..."
+          while [ $(($(date +%s) - connection_start_time)) -lt $connection_timeout ]; do
+            if grep -q "Sending (->" croc_output.log; then
+              connection_established=true
+              echo "Connection established! Transfer in progress..."
+              break
+            fi
+            sleep 2
+          done
+          
+          if [ "$connection_established" = false ]; then
+            echo "Connection timeout after ${connection_timeout}s. Killing croc process."
+            kill $croc_pid
+            cat croc_output.log
+            exit 1
+          fi
+          
+          # Once connection established, give a short time to complete transfer
+          echo "Transfer in progress, allowing up to 30 minutes to complete..."
+          transfer_timeout=1800  # 30 minutes should be enough for most IPA transfers
+          
+          transfer_start_time=$(date +%s)
+          while [ $(($(date +%s) - transfer_start_time)) -lt $transfer_timeout ]; do
+            if ! ps -p $croc_pid > /dev/null; then
+              echo "Transfer completed successfully!"
+              cat croc_output.log
+              exit 0
+            fi
+            sleep 5
+          done
+          
+          echo "Transfer timeout after ${transfer_timeout}s. Killing croc process."
+          kill $croc_pid
+          cat croc_output.log
+          exit 1
+
       - name: Upload to Litterbox
         id: upload
+        if: ${{ github.event.inputs.use_croc != 'true' }}
         run: |
           curl -L -o litterbox-uploader https://github.com/teflocarbon/litterbox-rust-upload/releases/download/release/litterbox-rust-upload-macOS-arm64
           chmod +x litterbox-uploader
